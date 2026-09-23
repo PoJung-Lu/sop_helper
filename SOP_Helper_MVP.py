@@ -40,7 +40,7 @@ try:
 except ImportError:
     win32com = None
 
-APP_TITLE = "SOP_Helper MVP v0.10.5"
+APP_TITLE = "SOP_Helper MVP v0.10.6"
 TORQUE_UNITS = ["kgf-cm", "N-M", "無需扭力", "鎖緊就好"]
 NO_TORQUE = "無需扭力"
 LOCK_ONLY = "鎖緊就好"
@@ -319,6 +319,10 @@ class MarkerListWidget(QListWidget):
         super().__init__()
         self.owner = owner
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        # 開啟清單內部拖曳排序；實際能否放下（是否跨越群組邊界）由 dropEvent 判斷，
+        # 拖曳只用來調整順序，不會改變標記的群組歸屬（歸屬變更一律透過 Tab 處理）。
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
 
     def event(self, event):
         # QAbstractItemView 預設會把 Tab 用於「切換到下一個 widget」的焦點跳轉，
@@ -333,6 +337,21 @@ class MarkerListWidget(QListWidget):
             self.owner.delete_selected_annotations_from_list()
             return
         super().keyPressEvent(event)
+
+    def dropEvent(self, event):
+        dragged_item = self.currentItem()
+        dragged_annotation_id = dragged_item.data(Qt.ItemDataRole.UserRole) if dragged_item else None
+        if not dragged_annotation_id:
+            # 群組標題列本身不可拖曳（build 時已設定 flags 不含 ItemIsDragEnabled 的效果由選取限制間接達成），
+            # 但仍保險擋一次，避免意外操作到標題列造成清單結構錯亂。
+            event.ignore()
+            return
+        target_row = self.indexAt(event.position().toPoint()).row()
+        if not self.owner.can_reorder_marker(dragged_annotation_id, target_row):
+            event.ignore()
+            return
+        super().dropEvent(event)
+        self.owner.on_marker_list_reordered()
 
 
 class MainWindow(QMainWindow):
@@ -416,7 +435,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.toggle_preview_btn)
         layout.addWidget(self.right_stack, 1)
         group_hint = QLabel(
-            "清單依標記順序（安裝步驟）排列，群組不改變順序，只用縮排與群組名稱標示。"
+            "清單依標記順序（安裝步驟）排列，可直接拖曳項目調整順序（僅限同群組內或無群組區內排序）。"
             "Ctrl/Shift 多選 ＋ Tab：選單筆已在群組內的標記→移出（剩1筆自動解散）；"
             "選滿整個既有群組→解散；其他情況（跨群組、含群組外標記、部分成員）→合併成新群組。"
             "雙擊群組標題列可改名；選取標記後按 Delete 可刪除；勾選框可切換「僅標記」。"
@@ -796,6 +815,44 @@ class MainWindow(QMainWindow):
             self.marker_list.setItemWidget(item, row_widget)
         self.marker_list.blockSignals(False)
 
+    def can_reorder_marker(self, dragged_annotation_id, target_row):
+        # 拖曳排序只允許在「同一個群組內部」或「無群組區內部」進行，不允許把標記拖進/拖出群組，
+        # 群組歸屬的變更一律透過 Tab 快捷鍵處理，避免拖放去猜測使用者到底想調順序還是想換群組。
+        dragged = self.find_annotation_by_id(dragged_annotation_id)
+        if dragged is None:
+            return False
+        if target_row < 0 or target_row >= self.marker_list.count():
+            # 放到清單最後（例如拖到空白處）視為合法，落點群組由後續同步邏輯決定。
+            target_row = self.marker_list.count() - 1
+        target_item = self.marker_list.item(target_row)
+        target_group_id = target_item.data(Qt.ItemDataRole.UserRole + 1)
+        if target_group_id:
+            # 放置點命中群組標題列本身，視為要落在該群組內第一個位置，只要落點群組跟原群組相同就允許。
+            return target_group_id == dragged.group_id
+        target_annotation_id = target_item.data(Qt.ItemDataRole.UserRole)
+        target_annotation = self.find_annotation_by_id(target_annotation_id) if target_annotation_id else None
+        if target_annotation is None:
+            # 落點是清單最後一行以外的位置（例如清單真正的尾端空白），視為落在最後一筆標記所屬的區塊。
+            return True
+        return target_annotation.group_id == dragged.group_id
+
+    def on_marker_list_reordered(self):
+        # 拖放完成後，清單目前的視覺順序就是新的安裝步驟順序，
+        # 依此重新賦值每一筆標記的 sequence（由 1 開始遞增），群組內外的相對順序都保留。
+        new_order = []
+        for i in range(self.marker_list.count()):
+            item = self.marker_list.item(i)
+            annotation_id = item.data(Qt.ItemDataRole.UserRole)
+            if annotation_id:
+                a = self.find_annotation_by_id(annotation_id)
+                if a is not None:
+                    new_order.append(a)
+        for i, a in enumerate(new_order, start=1):
+            a.sequence = i
+        self.rebuild_marker_list()
+        self.update_canvas_marks()
+        self.status.setText("已依拖曳後的順序重新編號安裝步驟")
+
     def update_canvas_marks(self):
         for item in self.annotation_items: self.canvas.scene.removeItem(item)
         self.annotation_items.clear()
@@ -877,7 +934,7 @@ class MainWindow(QMainWindow):
     def save_project(self):
         path, _ = QFileDialog.getSaveFileName(self, "另存專案", "SOP_project.json", "JSON (*.json)")
         if path:
-            data = {"project_version":"0.10.5", "source_image":self.image_path, "annotations":[asdict(a) for a in self.annotations], "components":[asdict(c) for c in self.components]}
+            data = {"project_version":"0.10.6", "source_image":self.image_path, "annotations":[asdict(a) for a in self.annotations], "components":[asdict(c) for c in self.components]}
             Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"); self.status.setText(f"已輸出專案：{path}")
 
     def copy_composite_image(self):
