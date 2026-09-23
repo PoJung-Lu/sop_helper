@@ -10,13 +10,14 @@ from pathlib import Path
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QFont
 from PySide6.QtWidgets import (
-    QSizePolicy,
+    QSizePolicy, QAbstractItemView, QWidget, QInputDialog,
     QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QGroupBox, QLabel, QListWidget, QListWidgetItem,
     QMainWindow, QMessageBox, QPushButton, QSpinBox, QDoubleSpinBox,
     QSplitter, QVBoxLayout, QHBoxLayout, QGraphicsView, QGraphicsScene,
     QCheckBox, QStackedWidget
 )
+
 from openpyxl import load_workbook
 import yaml
 from pptx import Presentation
@@ -39,7 +40,7 @@ try:
 except ImportError:
     win32com = None
 
-APP_TITLE = "SOP_Helper MVP v0.9.6"
+APP_TITLE = "SOP_Helper MVP v0.10.5"
 TORQUE_UNITS = ["kgf-cm", "N-M", "無需扭力", "鎖緊就好"]
 NO_TORQUE = "無需扭力"
 LOCK_ONLY = "鎖緊就好"
@@ -50,6 +51,7 @@ WINDOWS_FONT_FILE = r"C:\Windows\Fonts\msjh.ttc"
 WINDOWS_FONT_FAMILY = "Microsoft JhengHei"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp"}
 PPTX_MARKER_RADIUS_RATIO = 0.10 / 8.5
+CANVAS_MARKER_SCREEN_RADIUS = 14
 
 
 @dataclass
@@ -86,6 +88,7 @@ class Annotation:
     marker_only: bool = False
     label_x: float = 0.0
     label_y: float = 0.0
+    group_id: str | None = None
 
 
 class AnnotationDialog(QDialog):
@@ -195,6 +198,7 @@ class AnnotationCanvas(QGraphicsView):
             self.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
             self.zoom_factor = 1.0
             self.owner.update_zoom_label(self.zoom_factor)
+            self.owner.update_canvas_marks()
 
     def set_zoom_at(self, factor, anchor_view_pos=None):
         factor = max(0.25, min(4.0, factor))
@@ -210,6 +214,7 @@ class AnnotationCanvas(QGraphicsView):
         self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() + delta.x())
         self.verticalScrollBar().setValue(self.verticalScrollBar().value() + delta.y())
         self.owner.update_zoom_label(factor)
+        self.owner.update_canvas_marks()
 
     def wheelEvent(self, event):
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -241,7 +246,7 @@ class AnnotationCanvas(QGraphicsView):
                         self.owner.select_marker(hit.annotation_id)
                     else:
                         self.owner.try_select_marker_at(pos)
-                return
+            return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
@@ -276,7 +281,7 @@ class AnnotationCanvas(QGraphicsView):
             hit = self.owner.find_marker_at(pos)
             if hit is not None:
                 self.owner.edit_annotation(hit.annotation_id)
-                return
+            return
         super().mouseDoubleClickEvent(event)
 
     def dragEnterEvent(self, event):
@@ -309,6 +314,27 @@ class AnnotationCanvas(QGraphicsView):
             event.ignore()
 
 
+class MarkerListWidget(QListWidget):
+    def __init__(self, owner):
+        super().__init__()
+        self.owner = owner
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def event(self, event):
+        # QAbstractItemView 預設會把 Tab 用於「切換到下一個 widget」的焦點跳轉，
+        # 在 keyPressEvent 收到之前就被攔截掉，所以必須在 event() 這一層先擋下來。
+        if event.type() == event.Type.KeyPress and event.key() == Qt.Key.Key_Tab:
+            self.owner.create_group_from_selection()
+            return True
+        return super().event(event)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self.owner.delete_selected_annotations_from_list()
+            return
+        super().keyPressEvent(event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -318,6 +344,7 @@ class MainWindow(QMainWindow):
         self.annotations = []
         self.annotation_items = []
         self.selected_annotation_id = None
+        self.group_names = {}
         self.image_path = ""
         # 明確自行維護「是否已選取料件」狀態，不依賴 QListWidget 的 isSelected() 時序。
         self._component_selected = False
@@ -329,14 +356,16 @@ class MainWindow(QMainWindow):
         self.status = QLabel("已載入。未選取料件時可自由瀏覽圖片，選取料件後點擊圖片可新增標記。")
         self.mode_hint = QLabel("目前模式：瀏覽 / 選取")
         self.mode_hint.setWordWrap(True)
-        self.mode_hint.setMaximumWidth(260)
-        self.mode_hint.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.zoom_label = QLabel("縮放：100%")
-        self.marker_list = QListWidget()
+        self.marker_list = MarkerListWidget(self)
+        self.marker_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.marker_list.itemClicked.connect(self.on_marker_list_clicked)
+        self.marker_list.itemDoubleClicked.connect(self.on_marker_list_double_clicked)
         self.preview_label = QLabel("尚未產生輸出預覽")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setStyleSheet("background:#eeeeee; color:#555;")
+        self.preview_label.setMinimumSize(1, 1)
+        self.preview_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.right_stack = QStackedWidget()
         self.right_stack.addWidget(self.marker_list)
         self.right_stack.addWidget(self.preview_label)
@@ -354,7 +383,9 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(box)
         for text, slot in [("載入主圖片", self.load_image), ("載入 Excel / YAML", self.load_spec)]:
             b = QPushButton(text); b.clicked.connect(slot); layout.addWidget(b)
-        layout.addWidget(QLabel("可用料件（點擊選取後點圖新增標記；再點一次取消選取）"))
+        component_hint_label = QLabel("可用料件（點擊選取後點圖新增標記；再點一次取消選取）")
+        component_hint_label.setWordWrap(True)
+        layout.addWidget(component_hint_label)
         layout.addWidget(self.component_list, 1)
         b = QPushButton("使用選取料件新增標記"); b.clicked.connect(self.add_selected_component); layout.addWidget(b)
         b = QPushButton("取消選取料件（切換為瀏覽模式）"); b.clicked.connect(self.clear_component_selection); layout.addWidget(b)
@@ -384,6 +415,14 @@ class MainWindow(QMainWindow):
         self.toggle_preview_btn.clicked.connect(self.toggle_preview)
         layout.addWidget(self.toggle_preview_btn)
         layout.addWidget(self.right_stack, 1)
+        group_hint = QLabel(
+            "清單依標記順序（安裝步驟）排列，群組不改變順序，只用縮排與群組名稱標示。"
+            "Ctrl/Shift 多選 ＋ Tab：選單筆已在群組內的標記→移出（剩1筆自動解散）；"
+            "選滿整個既有群組→解散；其他情況（跨群組、含群組外標記、部分成員）→合併成新群組。"
+            "雙擊群組標題列可改名；選取標記後按 Delete 可刪除；勾選框可切換「僅標記」。"
+        )
+        group_hint.setWordWrap(True)
+        layout.addWidget(group_hint)
         actions = [
             ("複製為 PowerPoint 物件（可編輯）", self.copy_pptx_shapes),
             ("複製合成圖片（僅供備援）", self.copy_composite_image),
@@ -550,7 +589,7 @@ class MainWindow(QMainWindow):
         dialog.marker_only.setChecked(a.marker_only)
         if a.torque is not None:
             dialog.torque.setValue(a.torque)
-        dialog.unit.setCurrentText(a.torque_unit)
+            dialog.unit.setCurrentText(a.torque_unit)
         if dialog.exec() != QDialog.DialogCode.Accepted: return
         torque, unit, sequence, marker_only = dialog.values()
         a.torque, a.torque_unit, a.sequence, a.marker_only = torque, unit, sequence, marker_only
@@ -583,30 +622,197 @@ class MainWindow(QMainWindow):
             self.selected_annotation_id = annotation_id
             self.update_canvas_marks()
 
-    def rebuild_marker_list(self):
-        self.marker_list.clear()
+    def on_marker_list_double_clicked(self, item):
+        group_id = item.data(Qt.ItemDataRole.UserRole + 1)
+        if group_id:
+            self.rename_group(group_id)
+            return
+        annotation_id = item.data(Qt.ItemDataRole.UserRole)
+        if annotation_id:
+            self.edit_annotation(annotation_id)
+
+    def rename_group(self, group_id):
+        current = self.group_names.get(group_id, group_id)
+        text, ok = QInputDialog.getText(self, "群組名稱", "輸入新的群組名稱：", text=current)
+        if ok and text.strip():
+            self.group_names[group_id] = text.strip()
+            self.rebuild_marker_list()
+            self.status.setText(f"群組 {group_id} 已改名為「{text.strip()}」")
+
+    def on_marker_only_checkbox_toggled(self, annotation_id, checked):
+        a = self.find_annotation_by_id(annotation_id)
+        if a is None:
+            return
+        if checked == a.marker_only:
+            return
+        a.marker_only = checked
+        self.update_canvas_marks()
+        self.status.setText(f"標記 {a.sequence} 的「僅標記」已{'開啟' if checked else '關閉'}")
+
+    def selected_annotation_ids_in_list(self):
+        return [item.data(Qt.ItemDataRole.UserRole) for item in self.marker_list.selectedItems()
+                if item.data(Qt.ItemDataRole.UserRole)]
+
+    def delete_selected_annotations_from_list(self):
+        ids = self.selected_annotation_ids_in_list()
+        if not ids:
+            if self.selected_annotation_id:
+                ids = [self.selected_annotation_id]
+            else:
+                QMessageBox.information(self, "提示", "請先在標記清單選取要刪除的標記")
+                return
+        targets = [a for a in self.annotations if a.annotation_id in ids]
+        if not targets:
+            return
+        reply = QMessageBox.question(
+            self, "確認刪除",
+            f"確定要刪除選取的 {len(targets)} 筆標記嗎？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        for a in targets:
+            self.annotations.remove(a)
+        if self.selected_annotation_id in ids:
+            self.selected_annotation_id = None
+        self.rebuild_marker_list()
+        self.update_canvas_marks()
+        self.status.setText(f"已刪除 {len(targets)} 筆標記")
+
+    def new_group_id(self):
+        existing = {a.group_id for a in self.annotations if a.group_id}
+        n = 1
+        while f"G{n:03d}" in existing:
+            n += 1
+        return f"G{n:03d}"
+
+    def create_group_from_selection(self):
+        ids = self.selected_annotation_ids_in_list()
+        if not ids:
+            QMessageBox.information(self, "提示", "請先在標記清單選取標記，再按 Tab 或「建立群組」")
+            return
+        targets = [a for a in self.annotations if a.annotation_id in ids]
+
+        # 單筆選取的行為：已在群組內 -> 從群組移出（若移出後只剩1筆，該群組直接解散，因為單人群組沒有意義）；
+        # 不在任何群組 -> 沒有東西可以「合併」，跳提示。
+        if len(targets) == 1:
+            a = targets[0]
+            if a.group_id is None:
+                QMessageBox.information(self, "提示", "請先選取至少兩筆標記才能建立群組；若要把已在群組內的標記移出，單選該筆再按 Tab 即可")
+                return
+            group_id = a.group_id
+            group_members = [x for x in self.annotations if x.group_id == group_id]
+            a.group_id = None
+            a.marker_only = False
+            remaining = [x for x in group_members if x.annotation_id != a.annotation_id]
+            if len(remaining) <= 1:
+                for x in remaining:
+                    x.group_id = None
+                    x.marker_only = False
+                self.group_names.pop(group_id, None)
+            self.rebuild_marker_list()
+            self.update_canvas_marks()
+            self.status.setText(f"已將標記 {a.sequence} 移出群組" + ("，該群組僅剩1筆故一併解散" if len(remaining) <= 1 and remaining else ""))
+            return
+
+        # 判斷「選取內容是否完全等於某一個既有群組」：
+        # 選取的標記全部屬於同一個 group_id，且該 group_id 底下的成員數量剛好等於選取數量
+        # （代表選滿了整個群組，沒有漏選也沒有多選到其他群組或群組外的標記）。
+        # 符合條件 -> Tab 變成「解散」；不符合（跨群組、含群組外標記、只選部分成員）-> 一律合併成新群組。
+        selected_group_ids = {a.group_id for a in targets}
+        if len(selected_group_ids) == 1 and next(iter(selected_group_ids)) is not None:
+            only_group_id = next(iter(selected_group_ids))
+            group_members = [a for a in self.annotations if a.group_id == only_group_id]
+            if len(group_members) == len(targets):
+                self._dissolve_groups({only_group_id})
+                self.status.setText(f"已解散群組 {self.group_names.get(only_group_id, only_group_id)}（選取內容剛好等於整個群組）")
+                return
+
+        # 依「安裝步驟順序」（sequence）決定誰是群組中第一筆，不是依清單選取的點擊順序。
+        targets_in_order = sorted(targets, key=lambda a: a.sequence)
+        group_id = self.new_group_id()
+        for i, a in enumerate(targets_in_order):
+            a.group_id = group_id
+            a.marker_only = (i != 0)
+        self.group_names[group_id] = group_id
+        self.rebuild_marker_list()
+        self.update_canvas_marks()
+        self.status.setText(f"已建立群組 {group_id}（共 {len(targets_in_order)} 筆標記，依安裝順序第一筆顯示、其餘僅標記）")
+
+    def _dissolve_groups(self, group_ids):
+        count = 0
         for a in self.annotations:
-            c = self.components[a.component_index]
-            torque = self.torque_display(a)
-            suffix = "  [僅標記]" if a.marker_only else ""
-            text = f"{a.sequence}. {c.part_name}  {torque or NO_TORQUE}{suffix}"
-            item = QListWidgetItem(text)
+            if a.group_id in group_ids:
+                a.group_id = None
+                a.marker_only = False
+                count += 1
+        for gid in group_ids:
+            self.group_names.pop(gid, None)
+        self.rebuild_marker_list()
+        self.update_canvas_marks()
+        return count
+
+    def _marker_label_text(self, a):
+        c = self.components[a.component_index]
+        torque = self.torque_display(a)
+        return f"{a.sequence}. {c.part_name} {torque or NO_TORQUE}"
+
+    def _build_marker_row_widget(self, a):
+        # 用自訂 row widget（QLabel + QCheckBox）取代 QListWidgetItem 內建的核取方塊，
+        # 這樣核取方塊才能排在「料件名稱＋扭力」文字的右側，而不是 Qt 預設固定在最左邊。
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(24 if a.group_id else 4, 2, 4, 2)
+        label = QLabel(self._marker_label_text(a))
+        row_layout.addWidget(label)
+        row_layout.addStretch()
+        checkbox = QCheckBox("僅標記")
+        checkbox.setChecked(a.marker_only)
+        checkbox.toggled.connect(lambda checked, aid=a.annotation_id: self.on_marker_only_checkbox_toggled(aid, checked))
+        row_layout.addWidget(checkbox)
+        return row
+
+    def rebuild_marker_list(self):
+        self.marker_list.blockSignals(True)
+        self.marker_list.clear()
+        # 一律依 sequence（安裝步驟）排序，群組不改變安裝順序；群組內項目縮排並在群組第一筆前插入可改名的群組標題列。
+        sorted_annotations = sorted(self.annotations, key=lambda a: a.sequence)
+        seen_groups = set()
+        for a in sorted_annotations:
+            if a.group_id and a.group_id not in seen_groups:
+                seen_groups.add(a.group_id)
+                group_name = self.group_names.get(a.group_id, a.group_id)
+                header = QListWidgetItem(f"{group_name}\n" + "─" * 18)
+                header.setData(Qt.ItemDataRole.UserRole + 1, a.group_id)
+                header.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                header.setForeground(QColor("#0078d4"))
+                self.marker_list.addItem(header)
+            item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, a.annotation_id)
+            row_widget = self._build_marker_row_widget(a)
+            item.setSizeHint(row_widget.sizeHint())
             self.marker_list.addItem(item)
+            self.marker_list.setItemWidget(item, row_widget)
+        self.marker_list.blockSignals(False)
 
     def update_canvas_marks(self):
         for item in self.annotation_items: self.canvas.scene.removeItem(item)
         self.annotation_items.clear()
         if not self.canvas.image_item: return
         rect = self.canvas.scene.sceneRect()
-        # 標記圓圈半徑採用與 PPTX/PNG 輸出一致的比例（半徑 / 圖片寬度 ≈ 0.10/8.5），
-        # 讓畫布上看到的標記大小跟實際輸出結果一致，避免畫面與輸出物不同步的誤判。
-        r = max(6, rect.width() * PPTX_MARKER_RADIUS_RATIO)
+        # 圓圈半徑用固定的「螢幕像素」大小（不受圖片原始解析度影響），
+        # 用 QGraphicsView 目前的實際變換矩陣係數（transform().m11()）換算回場景座標，
+        # 這樣無論是 fitInView 自動縮放還是 Ctrl+滾輪手動縮放，圓圈在螢幕上呈現的視覺大小都維持一致。
+        view_scale = self.canvas.transform().m11()
+        view_scale = view_scale if view_scale > 0.0001 else 1.0
+        r = CANVAS_MARKER_SCREEN_RADIUS / view_scale
         for a in self.annotations:
             x, y = a.x*rect.width(), a.y*rect.height()
             is_selected = a.annotation_id == self.selected_annotation_id
             pen_color = QColor("#0078d4") if is_selected else QColor("red")
-            ellipse = self.canvas.scene.addEllipse(x-r, y-r, 2*r, 2*r, QPen(pen_color, 1.5 if not is_selected else 2.5))
+            pen_width = (1.5 if not is_selected else 2.5) / view_scale
+            ellipse = self.canvas.scene.addEllipse(x-r, y-r, 2*r, 2*r, QPen(pen_color, pen_width))
             text = self.canvas.scene.addSimpleText(str(a.sequence)); text.setBrush(pen_color)
             font = text.font(); font.setBold(True)
             digit_count = len(str(a.sequence))
@@ -671,7 +877,7 @@ class MainWindow(QMainWindow):
     def save_project(self):
         path, _ = QFileDialog.getSaveFileName(self, "另存專案", "SOP_project.json", "JSON (*.json)")
         if path:
-            data = {"project_version":"0.9.6", "source_image":self.image_path, "annotations":[asdict(a) for a in self.annotations], "components":[asdict(c) for c in self.components]}
+            data = {"project_version":"0.10.5", "source_image":self.image_path, "annotations":[asdict(a) for a in self.annotations], "components":[asdict(c) for c in self.components]}
             Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"); self.status.setText(f"已輸出專案：{path}")
 
     def copy_composite_image(self):
@@ -719,15 +925,19 @@ def get_windows_font(size):
 
 def clean_value(value, default=None): return default if value is None or (isinstance(value, str) and not value.strip()) else value
 
+
 def to_bool(value, default=False):
     if value is None or value == "": return default
     if isinstance(value, bool): return value
     return str(value).strip().lower() in {"true","1","yes","y","是","需要"}
 
+
 def to_float(value): return None if value is None or value == "" else float(value)
+
 
 def component_from_dict(row):
     return Component(str(clean_value(row.get("part_name"),"")).strip(), str(clean_value(row.get("part_number"),"")).strip(), str(clean_value(row.get("size"),"")).strip(), to_float(row.get("required_torque")), str(clean_value(row.get("torque_unit"),"")).strip(), str(clean_value(row.get("applicable_model"),"Universal")), str(clean_value(row.get("reference_image"),"")), to_bool(row.get("requires_oring")), str(clean_value(row.get("oring_spec"),"")), to_bool(row.get("requires_silicone_grease")), str(clean_value(row.get("silicone_grease_note"),"")), to_float(row.get("torque_min")), to_float(row.get("torque_max")), str(clean_value(row.get("notes"),"")))
+
 
 def validate_components(components):
     errors, warnings, seen = [], [], set()
@@ -744,6 +954,7 @@ def validate_components(components):
     if errors: raise ValueError("\n".join(errors))
     return warnings
 
+
 def load_components(path):
     path = Path(path); rows=[]
     if path.suffix.lower()==".xlsx":
@@ -752,6 +963,7 @@ def load_components(path):
     else: raise ValueError("只支援 .xlsx、.yaml、.yml")
     components=[component_from_dict(row) for row in rows]; return components, validate_components(components)
 
+
 def add_textbox(slide, left, top, width, height, text, size=12, color=RGBColor(0, 0, 0), align=PP_ALIGN.LEFT):
     box = slide.shapes.add_textbox(left, top, width, height)
     tf = box.text_frame; tf.clear(); tf.word_wrap = True; tf.vertical_anchor = MSO_ANCHOR.MIDDLE
@@ -759,7 +971,9 @@ def add_textbox(slide, left, top, width, height, text, size=12, color=RGBColor(0
     run = p.add_run(); run.text = text; run.font.name = WINDOWS_FONT_FAMILY; run.font.size = Pt(size); run.font.color.rgb = color
     return box
 
+
 def fit_box_size(text, font_size=11, pad_x=Inches(.12), pad_y=Inches(.06), min_width=Inches(.5), min_height=Inches(.3)):
+    # 依文字長度與字級估算方框寬高，短文字（如"鎖緊就好"）用較小方框，長扭力數字用較寬方框。
     char_width = int(Pt(font_size) * 0.62)
     text_width = char_width * max(len(text), 1)
     width = max(min_width, text_width + pad_x * 2)
@@ -768,6 +982,8 @@ def fit_box_size(text, font_size=11, pad_x=Inches(.12), pad_y=Inches(.06), min_w
 
 
 def point_toward(from_x, from_y, to_x, to_y, back_off=0):
+    # 從 (from_x, from_y) 朝 (to_x, to_y) 方向前進，但終點往回退 back_off 距離，
+    # 用於讓箭頭終點停在標記圓圈邊緣而不是圓心。
     dx, dy = to_x - from_x, to_y - from_y
     dist = (dx ** 2 + dy ** 2) ** 0.5
     if dist == 0:
@@ -777,6 +993,7 @@ def point_toward(from_x, from_y, to_x, to_y, back_off=0):
 
 
 def add_arrowhead(connector_shape):
+    # python-pptx 沒有直接的箭頭 API，改寫 XML 的 <a:ln> 節點加上三角形箭頭頭。
     ln = connector_shape.line._get_or_add_ln()
     for existing in ln.findall(qn('a:tailEnd')):
         ln.remove(existing)
@@ -825,7 +1042,9 @@ def export_pptx(path, image_path, components, annotations, window):
             add_arrowhead(line)
     prs.save(path)
 
+
 def main():
     app=QApplication(sys.argv); app.setFont(QFont(WINDOWS_FONT_FAMILY)); window=MainWindow(); window.show(); sys.exit(app.exec())
+
 
 if __name__=="__main__": main()
