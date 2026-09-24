@@ -40,7 +40,7 @@ try:
 except ImportError:
     win32com = None
 
-APP_TITLE = "SOP_Helper MVP v0.10.6"
+APP_TITLE = "SOP_Helper MVP v0.10.7"
 TORQUE_UNITS = ["kgf-cm", "N-M", "無需扭力", "鎖緊就好"]
 NO_TORQUE = "無需扭力"
 LOCK_ONLY = "鎖緊就好"
@@ -323,6 +323,8 @@ class MarkerListWidget(QListWidget):
         # 拖曳只用來調整順序，不會改變標記的群組歸屬（歸屬變更一律透過 Tab 處理）。
         self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self._press_pos = None
+        self._press_started_drag_eligible = False
 
     def event(self, event):
         # QAbstractItemView 預設會把 Tab 用於「切換到下一個 widget」的焦點跳轉，
@@ -337,6 +339,28 @@ class MarkerListWidget(QListWidget):
             self.owner.delete_selected_annotations_from_list()
             return
         super().keyPressEvent(event)
+
+    def mousePressEvent(self, event):
+        # Qt 對「按下位置命中已選取的項目」才會啟動拖曳，「命中未選取的項目」或「空白處」則走選取/框選；
+        # 但清單項目用 setItemWidget() 塞入自訂 QLabel/QCheckBox 之後，Qt 有時會把「命中未選取項目」
+        # 也誤判成可以直接拖曳，導致使用者在清單項目上想框選卻變成移動。這裡自行判斷一次：
+        # 只有「按下的項目在按下之前就已經被選取」才允許這次按下進入拖曳流程；否則先執行正常選取，
+        # 不啟動拖曳，這樣在清單項目附近按住拖曳，只要那個項目原本沒被選，就會表現成框選而不是移動。
+        item = self.itemAt(event.position().toPoint())
+        if item is not None and event.button() == Qt.MouseButton.LeftButton:
+            already_selected = item.isSelected()
+            self._press_started_drag_eligible = already_selected
+            if not already_selected:
+                super().mousePressEvent(event)
+                return
+        else:
+            self._press_started_drag_eligible = False
+        super().mousePressEvent(event)
+
+    def startDrag(self, supportedActions):
+        if not self._press_started_drag_eligible:
+            return
+        super().startDrag(supportedActions)
 
     def dropEvent(self, event):
         dragged_item = self.currentItem()
@@ -435,7 +459,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.toggle_preview_btn)
         layout.addWidget(self.right_stack, 1)
         group_hint = QLabel(
-            "清單依標記順序（安裝步驟）排列，可直接拖曳項目調整順序（僅限同群組內或無群組區內排序）。"
+            "清單依標記順序（安裝步驟）排列，可拖曳項目調整順序（僅限同群組內或無群組區內排序）。"
+            "拖曳只在已選取的項目上才會啟動，未選取的項目點下去先變成選取，"
+            "在空白處按住拖曳仍可框選多筆。"
             "Ctrl/Shift 多選 ＋ Tab：選單筆已在群組內的標記→移出（剩1筆自動解散）；"
             "選滿整個既有群組→解散；其他情況（跨群組、含群組外標記、部分成員）→合併成新群組。"
             "雙擊群組標題列可改名；選取標記後按 Delete 可刪除；勾選框可切換「僅標記」。"
@@ -822,17 +848,14 @@ class MainWindow(QMainWindow):
         if dragged is None:
             return False
         if target_row < 0 or target_row >= self.marker_list.count():
-            # 放到清單最後（例如拖到空白處）視為合法，落點群組由後續同步邏輯決定。
             target_row = self.marker_list.count() - 1
         target_item = self.marker_list.item(target_row)
         target_group_id = target_item.data(Qt.ItemDataRole.UserRole + 1)
         if target_group_id:
-            # 放置點命中群組標題列本身，視為要落在該群組內第一個位置，只要落點群組跟原群組相同就允許。
             return target_group_id == dragged.group_id
         target_annotation_id = target_item.data(Qt.ItemDataRole.UserRole)
         target_annotation = self.find_annotation_by_id(target_annotation_id) if target_annotation_id else None
         if target_annotation is None:
-            # 落點是清單最後一行以外的位置（例如清單真正的尾端空白），視為落在最後一筆標記所屬的區塊。
             return True
         return target_annotation.group_id == dragged.group_id
 
@@ -934,7 +957,7 @@ class MainWindow(QMainWindow):
     def save_project(self):
         path, _ = QFileDialog.getSaveFileName(self, "另存專案", "SOP_project.json", "JSON (*.json)")
         if path:
-            data = {"project_version":"0.10.6", "source_image":self.image_path, "annotations":[asdict(a) for a in self.annotations], "components":[asdict(c) for c in self.components]}
+            data = {"project_version":"0.10.7", "source_image":self.image_path, "annotations":[asdict(a) for a in self.annotations], "components":[asdict(c) for c in self.components]}
             Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"); self.status.setText(f"已輸出專案：{path}")
 
     def copy_composite_image(self):
